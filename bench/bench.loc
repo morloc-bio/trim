@@ -1,0 +1,37 @@
+--' trim-rust commands timed by run.sh
+--'
+--' Trimming uses Trim Galore's defaults.
+module trim-bench
+  ( ingestFastqPairs
+  , trimMlc
+  , trimText
+  )
+
+import bio
+import trim
+import trim-rust
+
+--' Trim a stream file of pairs into another
+--'
+--' Writes at compression level 3.
+trimMlc ::
+  --' Input stream file of read pairs
+  Str ->
+  --' Output stream file
+  Str ->
+  <IO> ()
+trimMlc input output = trimFile 0 3 defaultTrimOpts input output
+
+--' Trim paired FASTQ text into paired FASTQ text
+trimText ::
+  --' First-mate FASTQ file
+  Str ->
+  --' Second-mate FASTQ file
+  Str ->
+  --' Output first-mate FASTQ file
+  Str ->
+  --' Output second-mate FASTQ file
+  Str ->
+  <IO> ()
+trimText r1 r2 o1 o2 =
+  writeFastqPairs o1 o2 (mapSource (\xs -> .pairs (trimPairs defaultTrimOpts xs)) (readFastqPairs r1 r2))

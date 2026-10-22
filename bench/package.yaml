@@ -1,0 +1,7 @@
+name: trim-bench
+version: 0.1.0
+synopsis: Benchmarks of trim
+description: Times trim against Trim Galore 2.3.0, the version nf-core/rnaseq 3.27.0 pins.
+license: MIT
+tool-deps:
+  trim-galore: { version: "==2.3.0", channel: "bioconda" }

@@ -1,0 +1,11 @@
+name: trim
+version: 0.1.0
+homepage: null
+synopsis: Adapter and quality trimming of read pairs
+description: Trim Galore style adapter detection, quality and adapter trimming, and trimming statistics.
+category: bioinformatics
+license: MIT
+author: "Zebulun Arendsee"
+maintainer: "z@morloc.io"
+github: null
+bug-reports: null

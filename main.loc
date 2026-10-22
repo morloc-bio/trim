@@ -1,0 +1,232 @@
+--' Adapter and quality trimming of read pairs
+--'
+--' Each mate is quality trimmed from its 3' end (cutadapt's rule), then cut
+--' where its 3' adapter starts, by cutadapt's alignment: the adapter aligned
+--' to the read with unit-cost mismatches, insertions and deletions, either
+--' whole within the read (the leftmost such match) or as a prefix of at least
+--' `minOverlap` bases running off the read's end (the longest such), with at
+--' most floor(errorRate * aligned adapter bases) errors; the match starting
+--' first is cut. Bases compare ignoring case. A pair is kept only when
+--' both mates keep at least `minLength` bases, so a stream of pairs stays a
+--' stream of pairs. Defaults follow Trim Galore 2.3.0 as nf-core/rnaseq 3.27.0
+--' runs it: quality 20, error rate 0.1, overlap 1, length 20, adapter
+--' detected from the first reads.
+module trim
+  ( TrimOpts
+  , TrimStats
+  , Trimmed
+  , TrimmedReads
+  , AdapterCounts
+  , defaultTrimOpts
+  , trimPairs
+  , trimReads
+  , trimPair
+  , trimStats
+  , mergeTrimStats
+  , trimGaloreJson
+  , trimGaloreJsonSingle
+  , adapterCounts
+  , adapterCountsReads
+  , mergeAdapterCounts
+  , withDetectedAdapter
+  , checkTrimOpts
+  , trimFile
+  )
+
+import root
+import bio
+import parallel
+import stream as stream
+
+--' Trimming options
+record TrimOpts where
+  --' 3' adapter of the first mates
+  adapter :: Str
+  --' 3' adapter of the second mates
+  adapter2 :: Str
+  --' Most errors in an adapter match, per adapter base aligned
+  --'
+  --' Errors are mismatches, insertions and deletions.
+  errorRate :: Real
+  --' Fewest read bases an adapter match must cover
+  minOverlap :: Int
+  --' Phred cutoff for 3' quality trimming; 0 turns it off
+  quality :: Int
+  --' Shortest mate kept
+  minLength :: Int
+
+--' Trim Galore's defaults, with the Illumina adapter
+defaultTrimOpts :: TrimOpts
+defaultTrimOpts =
+  { adapter = "AGATCGGAAGAGC"
+  , adapter2 = "AGATCGGAAGAGC"
+  , errorRate = 0.1
+  , minOverlap = 1
+  , quality = 20
+  , minLength = 20
+  }
+
+--' What trimming did to a set of pairs
+--'
+--' A monoid: `trimStats []` is its identity and `mergeTrimStats` adds.
+record TrimStats where
+  --' Pairs seen
+  pairs :: Int
+  --' Pairs kept (both mates long enough)
+  kept :: Int
+  --' Bases in, per mate
+  basesIn :: (Int, Int)
+  --' Bases removed by quality trimming, per mate
+  qualityBases :: (Int, Int)
+  --' Bases removed as adapter, per mate
+  adapterBases :: (Int, Int)
+  --' Bases written over the kept pairs, per mate
+  basesOut :: (Int, Int)
+  --' First and second mates in which an adapter was found
+  adapterReads :: (Int, Int)
+  --' Per mate, mates by the length of adapter removed
+  --'
+  --' Index = length, capped at the end: cutadapt's "removed sequences".
+  adapterLengths :: ([Int], [Int])
+  --' Kept mates by length after trimming
+  --'
+  --' Index = length, capped at the end.
+  lengths :: [Int]
+
+--' Trimmed pairs, their input indices, and what trimming did
+record Trimmed where
+  --' The pairs kept, trimmed
+  pairs :: [ReadPair]
+  --' Index in the input batch of each kept pair
+  index :: [U32]
+  --' What trimming did
+  stats :: TrimStats
+
+--' Trim a batch of pairs
+trimPairs :: TrimOpts -> [ReadPair] -> Trimmed
+
+--' Trimmed single-end reads and what trimming did
+--'
+--' The statistics count each read as the first mate of a pair whose second
+--' mate is empty.
+record TrimmedReads where
+  --' The reads kept, trimmed
+  reads :: [FastqEntry]
+  --' Index in the input batch of each kept read
+  index :: [U32]
+  --' What trimming did
+  stats :: TrimStats
+
+--' Trim a batch of single-end reads
+--'
+--' Uses `adapter`; `adapter2` is unused.
+trimReads :: TrimOpts -> [FastqEntry] -> TrimmedReads
+
+--' Trim one pair, dropping it when a mate is too short
+--'
+--' The result holds the trimmed pair, or nothing.
+trimPair :: TrimOpts -> ReadPair -> [ReadPair]
+
+--' What trimming a batch of pairs does, without the reads
+trimStats :: TrimOpts -> [ReadPair] -> TrimStats
+
+--' Add two sets of trimming statistics
+mergeTrimStats :: TrimStats -> TrimStats -> TrimStats
+
+--' Trim Galore 2.x's JSON report for one mate of a set of pairs
+--'
+--' `*_trimming_report.json`, schema 1, which MultiQC reads as a Trim Galore
+--' report. Reads and bases written count the kept pairs; unpaired mates are
+--' never kept.
+trimGaloreJson ::
+  --' Name of the first-mate file
+  Str ->
+  --' Name of the second-mate file
+  Str ->
+  --' Mate the report is for, 1 or 2
+  Int ->
+  TrimOpts ->
+  TrimStats ->
+  Str
+
+--' Trim Galore 2.x's JSON report for single-end reads
+trimGaloreJsonSingle ::
+  --' Name of the reads file
+  Str ->
+  TrimOpts ->
+  TrimStats ->
+  Str
+
+--' Counts of the known adapters in a set of first mates
+--'
+--' Counts each adapter's first 13 bases: Illumina AGATCGGAAGAGC, Nextera
+--' CTGTCTCTTATA, small RNA TGGAATTCTCGG. A monoid under
+--' `mergeAdapterCounts`; `adapterCounts []` is its identity.
+record AdapterCounts where
+  --' First mates holding the Illumina adapter
+  illumina :: Int
+  --' First mates holding the Nextera adapter
+  nextera :: Int
+  --' First mates holding the small RNA adapter
+  smallRna :: Int
+  --' First mates seen
+  reads :: Int
+
+--' Adapter counts over the first mates of a batch of pairs
+adapterCounts :: [ReadPair] -> AdapterCounts
+
+--' Adapter counts over a batch of single-end reads
+adapterCountsReads :: [FastqEntry] -> AdapterCounts
+
+--' Add two sets of adapter counts
+mergeAdapterCounts :: AdapterCounts -> AdapterCounts -> AdapterCounts
+
+--' Options with the adapter Trim Galore would detect
+--'
+--' The most frequent adapter in the counts, Illumina on a tie or when none
+--' is seen. Both mates get it.
+withDetectedAdapter :: AdapterCounts -> TrimOpts -> TrimOpts
+
+--' Check trimming options; an error names the bad one
+checkTrimOpts :: TrimOpts -> Try Str TrimOpts
+checkTrimOpts o
+  ? .errorRate o < 0.0 = Err "trim: errorRate must lie in [0, 1)"
+  ? .errorRate o >= 1.0 = Err "trim: errorRate must lie in [0, 1)"
+  ? .minOverlap o < 1 = Err "trim: minOverlap must be at least 1"
+  ? .minLength o < 0 = Err "trim: minLength must not be negative"
+  ? .quality o < 0 = Err "trim: quality must not be negative"
+  : Ok o
+
+--' Trim a stream file of pairs into another
+--'
+--' `trimStats` over the input gives what trimming did.
+trimFile ::
+  --' Threads; 0 uses every core
+  Int ->
+  --' Compression level of the output, 0 to 9
+  Int ->
+  TrimOpts ->
+  --' Input stream file of pairs
+  --' @check.path r
+  Str ->
+  --' Output stream file
+  --' @check.path w
+  Str ->
+  <IO> ()
+trimFile threads level o input output = do
+  Ok s <- @open input
+  Ok out <- @open output
+  psconcatMapWith (.(.workers = threads) defaultParOpts) (trimPair o) (@next s) (stream.writeBatch level out)
+  @close out
+  ()
+
+-- Summaries as monoids, for `<>` and `mempty`.
+
+instance Semigroup TrimStats where
+  (<>) a b = mergeTrimStats a b
+
+instance Semigroup AdapterCounts where
+  (<>) a b = mergeAdapterCounts a b
+
+instance Monoid AdapterCounts where
+  mempty = adapterCounts []

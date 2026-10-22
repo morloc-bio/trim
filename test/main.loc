@@ -1,0 +1,154 @@
+--' The trim test suite, against a Python oracle
+--'
+--' Runs against whichever implementation module is imported alongside it.
+--' Trimmed output is compared with an independent Python oracle on
+--' generated reads.
+module trim.test (test)
+
+import root
+import bio
+import trim
+import unittest
+
+type Py => (Tuple7 a b c d e f g) = "tuple" a b c d e f g
+
+record Py => TrimOpts = "dict"
+record Py => TrimStats = "dict"
+record Py => AdapterCounts = "dict"
+
+source Py from "trim-test.py"
+  ( "tmp_path" as tmpPath
+  , "make_reads" as makeReads
+  , "oracle_check" as oracleCheck
+  , "oracle_stats" as oracleStats
+  , "oracle_mate_stats" as oracleMateStats
+  , "check_trim_galore_json" as checkTrimGaloreJson
+  , "oracle_single_stats" as oracleSingleStats
+  , "check_single_json" as checkSingleJson
+  , "oracle_index" as oracleIndex
+  , "oracle_single_index" as oracleSingleIndex
+  )
+
+tmpPath :: Str -> <IO> Str
+makeReads :: Str -> Int -> Int -> Str -> <IO> ()
+oracleCheck :: Str -> Str -> Str -> Str -> TrimOpts -> <IO> Str
+oracleStats :: Str -> Str -> TrimOpts -> <IO> (Int, Int, Int, Int)
+oracleMateStats :: Str -> Str -> TrimOpts -> TrimStats -> <IO> Str
+checkTrimGaloreJson :: Str -> Int -> TrimStats -> <IO> Str
+oracleSingleStats :: Str -> TrimOpts -> <IO> (Int, Int, Int, Int, Int, Int, Int)
+checkSingleJson :: Str -> TrimStats -> <IO> Str
+
+singleTuple :: TrimStats -> (Int, Int, Int, Int, Int, Int, Int)
+singleTuple s =
+  ( .pairs s
+  , .kept s
+  , .0 (.adapterReads s)
+  , .0 (.basesIn s)
+  , .0 (.qualityBases s)
+  , .0 (.adapterBases s)
+  , .0 (.basesOut s)
+  )
+
+firstMates :: [ReadPair] -> [FastqEntry]
+firstMates xs = map (\x -> .0 x) xs
+
+truSeq :: Str
+truSeq = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"
+
+nexteraFull :: Str
+nexteraFull = "CTGTCTCTTATACACATCTCCGAGCCCACGAGAC"
+
+strict :: TrimOpts
+strict = .(.minOverlap = 3, .quality = 30, .minLength = 50, .errorRate = 0.2) defaultTrimOpts
+
+isErr :: Try Str a -> Bool
+isErr r = match r
+  | (Err _) = True
+  | (Ok _) = False
+
+statsTuple :: TrimStats -> (Int, Int, Int, Int)
+statsTuple s = (.pairs s, .kept s, .0 (.adapterReads s), .1 (.adapterReads s))
+
+lengthTotal :: TrimStats -> Int
+lengthTotal s = sum (.lengths s)
+
+oracleIndex :: Str -> Str -> TrimOpts -> <IO> [U32]
+oracleSingleIndex :: Str -> TrimOpts -> <IO> [U32]
+
+-- Trim a generated read set through morloc stream files and check it.
+trimCase :: Str -> TrimOpts -> Results -> <IO> Results
+trimCase name o s0 = do
+  p <- tmpPath name
+  makeReads p 3000 7 truSeq
+  ingestFastqPairs 0 (p <> "_1.fq") (p <> "_2.fq") (p <> ".mlc")
+  trimFile 0 3 o (p <> ".mlc") (p <> "-t.mlc")
+  inputs <- collectSource (loadSource (p <> ".mlc"))
+  let st = trimStats o inputs
+  writeFastqPairs (p <> "-t_1.fq") (p <> "-t_2.fq") (loadSource (p <> "-t.mlc"))
+  msg <- oracleCheck (p <> "_1.fq") (p <> "_2.fq") (p <> "-t_1.fq") (p <> "-t_2.fq") o
+  want <- oracleStats (p <> "_1.fq") (p <> "_2.fq") o
+  pairs <- collectSource (loadSource (p <> ".mlc"))
+  mates <- oracleMateStats (p <> "_1.fq") (p <> "_2.fq") o st
+  j1 <- checkTrimGaloreJson (trimGaloreJson "a_1.fq" "a_2.fq" 1 o st) 1 st
+  j2 <- checkTrimGaloreJson (trimGaloreJson "a_1.fq" "a_2.fq" 2 o st) 2 st
+  let single = trimReads o (firstMates pairs)
+  wantSingle <- oracleSingleStats (p <> "_1.fq") o
+  js <- checkSingleJson (trimGaloreJsonSingle "a.fq" o (.stats single)) (.stats single)
+  wantIndex <- oracleIndex (p <> "_1.fq") (p <> "_2.fq") o
+  wantSingleIndex <- oracleSingleIndex (p <> "_1.fq") o
+  ( testEqual (name <> ": trimmed pairs match the oracle") msg ""
+  . testEqual (name <> ": each kept pair's input index") (.index (trimPairs o pairs)) wantIndex
+  . testEqual (name <> ": each kept read's input index") (.index single) wantSingleIndex
+  . testEqual (name <> ": single-end statistics match the oracle") (singleTuple (.stats single)) wantSingle
+  . testEqual (name <> ": single-end keeps the counted reads") (length (.reads single)) (.kept (.stats single))
+  . testEqual (name <> ": single-end Trim Galore JSON") js ""
+  . testEqual (name <> ": per-mate statistics match the oracle") mates ""
+  . testEqual (name <> ": Trim Galore JSON for mate 1") j1 ""
+  . testEqual (name <> ": Trim Galore JSON for mate 2") j2 ""
+  . testEqual (name <> ": statistics match the oracle") (statsTuple st) want
+  . testEqual (name <> ": length histogram counts every kept mate") (lengthTotal st) (2 * .kept st)
+  . testEqual (name <> ": trimStats agrees with trimPairs") (statsTuple (trimStats o pairs)) want
+  ) s0
+
+testDetect :: Results -> <IO> Results
+testDetect s0 = do
+  p <- tmpPath "nextera"
+  makeReads p 2000 11 nexteraFull
+  ingestFastqPairs 0 (p <> "_1.fq") (p <> "_2.fq") (p <> ".mlc")
+  Ok s <- @open (p <> ".mlc")
+  Ok c <- reduce adapterCounts mergeAdapterCounts (\x -> x) (@next s)
+  q <- tmpPath "illumina"
+  makeReads q 2000 12 truSeq
+  ingestFastqPairs 0 (q <> "_1.fq") (q <> "_2.fq") (q <> ".mlc")
+  Ok s2 <- @open (q <> ".mlc")
+  Ok c2 <- reduce adapterCounts mergeAdapterCounts (\x -> x) (@next s2)
+  ( testEqual "Nextera reads select the Nextera adapter"
+      (.adapter (withDetectedAdapter c defaultTrimOpts))
+      "CTGTCTCTTATA"
+  . testEqual "the detected adapter is used for both mates"
+      (.adapter2 (withDetectedAdapter c defaultTrimOpts))
+      "CTGTCTCTTATA"
+  . testEqual "TruSeq reads select the Illumina adapter"
+      (.adapter (withDetectedAdapter c2 defaultTrimOpts))
+      "AGATCGGAAGAGC"
+  . testEqual "adapter counts see every first mate" (.reads c) 2000
+  . testTrue "no adapter seen selects Illumina"
+      (.adapter (withDetectedAdapter (adapterCounts []) defaultTrimOpts) == "AGATCGGAAGAGC")
+  ) s0
+
+testOptions :: Results -> Results
+testOptions =
+  ( testTrue "an error rate of 1.5 is rejected" (isErr (checkTrimOpts (.(.errorRate = 1.5) defaultTrimOpts)))
+  . testTrue "a zero overlap is rejected" (isErr (checkTrimOpts (.(.minOverlap = 0) defaultTrimOpts)))
+  . testTrue "the defaults are accepted" (not (isErr (checkTrimOpts defaultTrimOpts)))
+  )
+
+test :: <IO> Bool
+test = suiteE runTests
+
+runTests :: Results -> <IO> Results
+runTests s0 = do
+  s1 <- groupE "Trim Galore defaults" (trimCase "defaults" defaultTrimOpts) s0
+  s2 <- groupE "Strict options" (trimCase "strict" strict) s1
+  s3 <- groupE "Adapter detection" testDetect s2
+  group "Options" testOptions s3
